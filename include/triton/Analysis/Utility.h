@@ -117,19 +117,17 @@ private:
   int axis;
 };
 
-// Lower a scan in three phases: scan thread-local segments, scan their totals
-// within each warp-local segment, then exchange and scan warp-local totals.
-// Complete the saved thread-local prefixes with the resulting carries. The
-// inter-warp phase either loads the full totals sequence into
-// interWarpScanLayout or traverses its shared-memory table incrementally to
-// limit live registers.
+// Our algorithm lowers a scan in three phases: scan thread-local segments, scan
+// their totals within each warp-local segment, then exchange and scan
+// warp-local totals.
 //
 // Segment: a contiguous range along the scan axis owned by one thread or warp.
-// A totals layout maps physical owners to segment indices. A scan layout
-// redistributes those totals for ordered accumulation.
+// Total layout: a LinearLayout that maps hardware resources to segment indices.
+// Scan layout: a LinearLayout that makes logical elements contiguous within
+// each thread or warp.
 //
 // Example: forward sum of x0..x31 with two warps and two distinct lane owners
-// per warp. R, L, W list scan-axis register, lane, and warp bases. Four zero
+// per warp. R, L, W list scan-axis register, lane, and warp bases. Zero
 // lane bases and the empty block dimension are omitted. R=[] means one value
 // per thread.
 //
@@ -172,42 +170,31 @@ private:
 //      each warp, lane 0: S0=W0; lane 1: S1=W0+W1
 //
 // Carry propagation:
-//    Map the consumer's warp-segment index s to the preceding prefix S(s-1)
-//    using the inverse of interWarpScanLayout. Warp 0 has no carry; warp 1
-//    reads S0 from lane 0 of its own warp. Apply this carry to the saved Uj:
+//    Map each consumer's warp-segment index s to the preceding prefix S(s-1)
+//    using the inverse of interWarpScanLayout. Warp 0 has no carry. Warp 1
+//    receives S0=Q7 through the inter-warp phase and retains it in registers.
+//    Apply this carry to the saved Uj:
 //      warp 0: Qj=Uj                for j=0..7
 //      warp 1: Qj=S0+Uj=T0+...+Tj  for j=8..15
-//    Qj is a prefix from the scan's start and retains intraWarpScanLayout.
-//    The Sj values remain broadcast across warps in interWarpScanLayout.
-//    Convert Qj back to intraWarpTotalsLayout:
-//      warp 0, lane 0: Q0,Q2,Q4,Q6; lane 1: Q1,Q3,Q5,Q7
-//      warp 1, lane 0: Q8,Q10,Q12,Q14; lane 1: Q9,Q11,Q13,Q15
-//    Replace each saved pair's terminal value with Qj. Complete its first
-//    value with Q(j-1)+x(2j), leaving x0 unchanged. The first pair in warp 1
-//    uses its inter-warp carry S0=Q7. Invert the register permutation to return
-//    the completed element prefixes from permutedLayout to originalLayout.
+//    Each Qj is a global prefix over thread-local totals T0,...,Tj and retains
+//    intraWarpScanLayout. Convert these prefixes back to intraWarpTotalsLayout:
+//      warp 0, lane 0: Q0,Q2,Q4,Q6;     lane 1: Q1,Q3,Q5,Q7
+//      warp 1, lane 0: Q8,Q10,Q12,Q14;  lane 1: Q9,Q11,Q13,Q15
+//    For each thread segment, we can replace the terminal value with Qj, but the
+//    other values have to be updated using the preceding prefix Q(j-1).
+//    To obtain Q(j-1), map the preceding logical index j-1 through
+//    the inverse of intraWarpTotalsLayout to obtain its source register and
+//    lane. In warp 1, the required sources are:
+//      destination register | lane 0 needs   |  lane 1 needs
+//      r0                   | retained Q7    | r0/lane 0 (Q8)
+//      r1                   | r0/lane 1 (Q9) | r1/lane 0 (Q10)
+//      r2                   | r1/lane 1 (Q11)| r2/lane 0 (Q12)
+//      r3                   | r2/lane 1 (Q13)| r3/lane 0 (Q14)
 //
-// Grouped inter-warp traversal:
-//    This path applies when thread-local and warp-local segments coincide and
-//    the inter-warp scan axis lies entirely in registers. interWarpScanLayout
-//    describes the full sequence available to each participating warp. The
-//    lowering loads and accumulates totals in logical order, completing each
-//    consumer as soon as its last candidate prefix has been processed.
-//
-//    For an axis-0 scan of 128x32 (f32,i64) tuples, use four 32-lane warps.
-//    Lane l owns column l; warp w owns rows 4r+w. Both segment sizes are one.
-//    Let T(s,l) be the segment total for row s and column l. Scan-axis bases
-//    are R=[4,8,16,32,64], L=[0,0,0,0,0], W=[1,2]; lane bases index columns.
-//    interWarpTotalsLayout preserves this ownership. interWarpScanLayout has
-//    R=[1,2,4,8,16,32,64], the same column lane bases, and W=[0,0].
-//    Store T(s,l) at element offset 32*s+l in each operand's shared table and
-//    synchronize once after all operands are stored. Each warp's lane l reads
-//    T(0,l),...,T(127,l), maintaining one running tuple prefix. Layout division
-//    separates the scan axis from independent scans and gives their table
-//    bases. Warp w consumes the inclusive prefixes for s=4r+w directly. For
-//    segments with several elements, apply the exclusive prefix to their saved
-//    local prefixes, guarding the first segment. This completes the element
-//    values during the shared-memory traversal.
+//    We use the gather-like algorithm to shuffle both candidate registers from
+//    the computed source lane, then select the result whose register index
+//    matches the computed source register. For example, lane 0's r1 fetches
+//    both r0 and r1 from lane 1 and selects r0, which contains Q9.
 //
 class ScanLoweringHelper {
 public:

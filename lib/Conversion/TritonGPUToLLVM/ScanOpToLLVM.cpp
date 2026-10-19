@@ -304,6 +304,26 @@ private:
   // Store the complete totals table once. Scan each independent sequence,
   // selecting carries only at positions requested by their consumers.
   // Complete each consumer's local prefixes as soon as its carry is available.
+  // This path applies when thread-local and warp-local segments coincide and
+  // the inter-warp scan axis lies entirely in registers. interWarpScanLayout
+  // describes the full sequence available to each participating warp. The
+  // lowering loads and accumulates totals in logical order, completing each
+  // consumer as soon as its last candidate prefix has been processed.
+  //
+  // For an axis-0 scan of 128x32 (f32,i64) tuples, use four 32-lane warps.
+  // Lane l owns column l; warp w owns rows 4r+w. Both segment sizes are one.
+  // Let T(s,l) be the segment total for row s and column l. Scan-axis bases
+  // are R=[4,8,16,32,64], L=[0,0,0,0,0], W=[1,2]; lane bases index columns.
+  // interWarpTotalsLayout preserves this ownership. interWarpScanLayout has
+  // R=[1,2,4,8,16,32,64], the same column lane bases, and W=[0,0].
+  // Store T(s,l) at element offset 32*s+l in each operand's shared table and
+  // synchronize once after all operands are stored. Each warp's lane l reads
+  // T(0,l),...,T(127,l), maintaining one running tuple prefix. Layout
+  // division separates the scan axis from independent scans and gives their
+  // table bases. Warp w consumes the inclusive prefixes for s=4r+w directly.
+  // For segments with several elements, apply the exclusive prefix to their
+  // saved local prefixes, guarding the first segment. This completes the
+  // element values during the shared-memory traversal.
   void scanInterWarpGroups(triton::ScanOp op, const ScanLoweringHelper &helper,
                            const ScanValues &totals, ScanValues &values,
                            Value laneId, Value warpId,
