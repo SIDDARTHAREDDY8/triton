@@ -196,18 +196,11 @@ private:
 //      r2                     | r1/lane 1 (Q11) | r2/lane 0 (Q12)
 //      r3                     | r2/lane 1 (Q13) | r3/lane 0 (Q14)
 //    Each total slot r supplies the carry for saved element registers 2r,2r+1.
-//    Q7 is the retained inter-warp carry; a lane shuffle stays within its warp.
-//
 //    For each destination slot, enumerate candidate source registers across
 //    lanes. Shuffle each candidate from the computed source lane, then select
 //    the candidate matching the computed source register. For r1, the
 //    candidates are r0 and r1: lane 0 selects r0 from lane 1 (Q9), while lane 1
-//    selects r1 from lane 0 (Q10). The boundary lookup wraps within the warp
-//    segment, and its predicate excludes that result. Use the retained
-//    inter-warp carry at this boundary, or leave the scan's first pair
-//    unchanged. Finally, invert the register permutation to restore
-//    originalLayout. Reverse scans use the same mappings with the next logical
-//    index and guard the last segment along the axis.
+//    selects r1 from lane 0 (Q10).
 //
 class ScanLoweringHelper {
 public:
