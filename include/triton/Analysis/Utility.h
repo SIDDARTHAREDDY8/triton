@@ -117,14 +117,17 @@ private:
   int axis;
 };
 
-// Our algorithm lowers a scan in three phases: scan thread-local segments, scan
+// Lower a scan in three phases: scan thread-local segments, scan
 // their totals within each warp-local segment, then exchange and scan
 // warp-local totals.
 //
 // Segment: a contiguous range along the scan axis owned by one thread or warp.
-// Total layout: a LinearLayout that maps hardware resources to segment indices.
-// Scan layout: a LinearLayout that makes logical elements contiguous within
-// each thread or warp.
+// Total layout: maps registers, lanes, and warps to segment indices along the
+// scan axis, preserving coordinates for independent scans.
+// Scan layout: ownership used to accumulate totals within a warp. The
+// intra-warp scan layout places low axis bits in registers before lanes. The
+// inter-warp scan layout replicates each full totals sequence across its
+// participating warps.
 //
 // Example: forward sum of x0..x31 with two warps and two distinct lane owners
 // per warp. R, L, W list scan-axis register, lane, and warp bases. Zero
@@ -145,8 +148,8 @@ private:
 //      warp 0, lane 0: T0,T2,T4,T6; lane 1: T1,T3,T5,T7
 //      warp 1, lane 0: T8,T10,T12,T14; lane 1: T9,T11,T13,T15
 //    intraWarpScanLayout: R=[1,2], L=[4], W=[8].
-//    Put the segment's register bits before its lane bits and convert with
-//    warp shuffles. Each thread now holds four consecutive totals:
+//    Put each warp-local segment's register bits before its lane bits and
+//    convert with warp shuffles. Each thread now holds four consecutive totals:
 //      warp 0, lane 0: T0,T1,T2,T3; lane 1: T4,T5,T6,T7
 //      warp 1, lane 0: T8,T9,T10,T11; lane 1: T12,T13,T14,T15
 //    Scan registers, then lanes. Slot j holds Uj=T(8w)+...+Tj in warp w.
@@ -176,25 +179,35 @@ private:
 //    Apply this carry to the saved Uj:
 //      warp 0: Qj=Uj                for j=0..7
 //      warp 1: Qj=S0+Uj=T0+...+Tj  for j=8..15
-//    Each Qj is a global prefix over thread-local totals T0,...,Tj and retains
-//    intraWarpScanLayout. Convert these prefixes back to intraWarpTotalsLayout:
+//    Qj=T0+...+Tj=x0+...+x(2j+1): j indexes thread-local segments. In
+//    particular, Q7 ends at x15. These prefixes retain intraWarpScanLayout.
+//    Convert them back to intraWarpTotalsLayout to restore the ownership of
+//    each Tj:
 //      warp 0, lane 0: Q0,Q2,Q4,Q6;     lane 1: Q1,Q3,Q5,Q7
 //      warp 1, lane 0: Q8,Q10,Q12,Q14;  lane 1: Q9,Q11,Q13,Q15
-//    For each thread segment, we can replace the terminal value with Qj, but the
-//    other values have to be updated using the preceding prefix Q(j-1).
-//    To obtain Q(j-1), map the preceding logical index j-1 through
-//    the inverse of intraWarpTotalsLayout to obtain its source register and
-//    lane. In warp 1, the required sources are:
-//      destination register | lane 0 needs   |  lane 1 needs
-//      r0                   | retained Q7    | r0/lane 0 (Q8)
-//      r1                   | r0/lane 1 (Q9) | r1/lane 0 (Q10)
-//      r2                   | r1/lane 1 (Q11)| r2/lane 0 (Q12)
-//      r3                   | r2/lane 1 (Q13)| r3/lane 0 (Q14)
+//    Replace each saved pair's terminal value Tj with Qj. Its first element
+//    becomes Q(j-1)+x(2j), except that x0 remains unchanged. The return
+//    conversion provides the inclusive Qj; fetching Q(j-1) is a separate step.
+//    Map j-1 through the inverse of intraWarpTotalsLayout to obtain its source
+//    register and lane. In warp 1, the required sources are:
+//      destination total slot | lane 0 needs    | lane 1 needs
+//      r0                     | retained Q7     | r0/lane 0 (Q8)
+//      r1                     | r0/lane 1 (Q9)  | r1/lane 0 (Q10)
+//      r2                     | r1/lane 1 (Q11) | r2/lane 0 (Q12)
+//      r3                     | r2/lane 1 (Q13) | r3/lane 0 (Q14)
+//    Each total slot r supplies the carry for saved element registers 2r,2r+1.
+//    Q7 is the retained inter-warp carry; a lane shuffle stays within its warp.
 //
-//    We use the gather-like algorithm to shuffle both candidate registers from
-//    the computed source lane, then select the result whose register index
-//    matches the computed source register. For example, lane 0's r1 fetches
-//    both r0 and r1 from lane 1 and selects r0, which contains Q9.
+//    For each destination slot, enumerate candidate source registers across
+//    lanes. Shuffle each candidate from the computed source lane, then select
+//    the candidate matching the computed source register. For r1, the
+//    candidates are r0 and r1: lane 0 selects r0 from lane 1 (Q9), while lane 1
+//    selects r1 from lane 0 (Q10). The boundary lookup wraps within the warp
+//    segment, and its predicate excludes that result. Use the retained
+//    inter-warp carry at this boundary, or leave the scan's first pair
+//    unchanged. Finally, invert the register permutation to restore
+//    originalLayout. Reverse scans use the same mappings with the next logical
+//    index and guard the last segment along the axis.
 //
 class ScanLoweringHelper {
 public:

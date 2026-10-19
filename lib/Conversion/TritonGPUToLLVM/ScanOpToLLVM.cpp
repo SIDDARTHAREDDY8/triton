@@ -32,6 +32,9 @@ struct ScanOpConversion : public ConvertOpToLLVMPattern<triton::ScanOp> {
       return op.emitError("scan axis distributed across CTAs is not supported");
 
     auto loc = op.getLoc();
+    // The LLVM representation stores only unique register values. Match the
+    // helper's layout with zero register bases removed, so broadcast copies
+    // share the same scan computation and remain implicit in the result.
     ScanValues values;
     for (Value operand : adaptor.getOperands()) {
       auto unpacked = unpackUniqueTensorElements(loc, operand, rewriter);
@@ -63,6 +66,11 @@ struct ScanOpConversion : public ConvertOpToLLVMPattern<triton::ScanOp> {
   }
 
 private:
+  // Keep element prefixes in their thread owners while subsequent phases
+  // exchange only segment totals. Optional layouts omit phases whose segment
+  // is already owned by one thread or warp. The intra-warp scan layout remains
+  // active through inter-warp total extraction, avoiding an intermediate
+  // conversion back to the element owners.
   void scanWithinCTA(triton::ScanOp op, const ScanLoweringHelper &helper,
                      ScanValues &values, Value laneId, Value warpId,
                      ConversionPatternRewriter &rewriter) const {
@@ -81,6 +89,8 @@ private:
     permuteRegisters(values, helper.getRegisterOrder().inverse());
   }
 
+  // Change the C++ container order for operand-wise layout conversion. This
+  // transposition emits no IR and does not change hardware ownership.
   static ScanValues transposeValues(const ScanValues &values) {
     ScanValues result(values.front().size());
     for (const auto &row : values)
@@ -129,6 +139,10 @@ private:
     values = transposeValues(operands);
   }
 
+  // Intra-warp redistributions force register/shuffle lowering, avoiding shared
+  // scratch and synchronization even if the generic conversion heuristic would
+  // choose shared memory. Inter-warp conversion clears this flag to enable the
+  // target's shared-memory lowering. Identical layouts require no conversion.
   void convertScanValues(triton::ScanOp op, ScanValues &values,
                          const LinearLayout &src, const LinearLayout &dst,
                          ConversionPatternRewriter &rewriter,
@@ -142,7 +156,10 @@ private:
   }
 
   // Scan each thread-local segment in traversal order, preserving combiner
-  // operand order for both forward and reverse scans.
+  // operand order for both forward and reverse scans. A segment of n values
+  // needs n-1 combines, and every intermediate result is an output prefix.
+  // Reversing the register traversal also puts its total in the first register;
+  // no preliminary register reversal or identity value is required.
   void scanWithinThreads(triton::ScanOp op, ScanValues &values,
                          unsigned numRegs,
                          ConversionPatternRewriter &rewriter) const {
@@ -158,7 +175,12 @@ private:
   }
 
   // Each round shuffles the preceding lanes' terminal total and combines it
-  // with every register prefix in the group.
+  // with every register prefix in the group. One tuple of shuffled values is
+  // reused across numRegs prefixes. For four totals per lane and eight lanes,
+  // there are three shuffle rounds, each followed by four tuple combines.
+  // Updating all prefixes during these rounds completes the group without a
+  // separate exclusive-carry shuffle. The cost is a combine per register per
+  // round. A register-only sequence exits before creating lane indices.
   void scanLaneTotals(triton::ScanOp op, ScanValues &values,
                       const LinearLayout &layout, unsigned numRegs,
                       unsigned numSegments, Value laneId,
@@ -184,7 +206,10 @@ private:
       segmentIndex = b.and_(index, b.i32_val(numSegments - 1));
 
     // Shift logical coordinates and invert the layout to find the source lane.
-    // Preserve coordinates belonging to independent scans.
+    // Preserve coordinates belonging to independent scans. Compute source lanes
+    // and boundary predicates once and reuse them across register groups and
+    // tuple operands. A recognized shuffle-up distance also eliminates the
+    // runtime source-lane calculation for that round.
     SmallVector<std::tuple<Value, Value, std::optional<unsigned>>> rounds;
     for (unsigned offset = 1; offset < numLanes; offset *= 2) {
       int distance = offset * numRegs;
@@ -217,9 +242,13 @@ private:
     }
   }
 
-  // Extract thread-local totals and convert to contiguous register groups.
-  // Scan those groups, then their terminal values across lanes. Save the
-  // element prefixes for carry propagation.
+  // Extract thread-local totals in intraWarpTotalsLayout and convert them to
+  // intraWarpScanLayout. Scan its contiguous register groups, then combine
+  // prefixes across lanes. Return warp-local prefixes in intraWarpScanLayout;
+  // the caller retains the original element prefixes for carry propagation.
+  // Making low axis bits register-owned lets one lane-total shuffle serve
+  // several totals. Only the extracted totals pay the conversion cost; the
+  // elements within their original thread-local segments stay in place.
   ScanValues scanWithinWarps(triton::ScanOp op,
                              const ScanLoweringHelper &helper,
                              const ScanValues &values, Value laneId,
@@ -245,8 +274,9 @@ private:
   }
 
   // Convert warp-local segment totals into the full sequence in each
-  // participating warp, then scan it. Return exclusive carries in the
-  // original warp-segment ownership.
+  // participating warp, then scan it. Return exclusive carries in
+  // interWarpTotalsLayout. Grouped traversal completes values directly and
+  // returns no carries.
   SmallVector<ScanCarry>
   scanAcrossWarps(triton::ScanOp op, const ScanLoweringHelper &helper,
                   ScanValues &values, Value laneId, Value warpId,
@@ -275,6 +305,10 @@ private:
 
     // Replicate each complete total according to interWarpTotalsLayout before
     // the conversion selects a source owner for its shared-memory store.
+    // Collapsing the segment turns its lane bases into zero bases: every such
+    // lane must then hold the same total, allowing the converter to choose any
+    // equivalent owner. Without lane-owned segment bits, extraction alone
+    // provides the total and this shuffle is omitted.
     auto totals = extractSegmentTotals(values, segmentRegs, reverse);
     if (segmentLaneMask) {
       Value terminalLane;
@@ -292,6 +326,10 @@ private:
     convertScanValues(op, totals, interWarpTotalsLayout, totalsLayout, rewriter,
                       /*forceWarpShuffle=*/false);
 
+    // Replication makes the full totals sequence available within each warp.
+    // Reuse the CTA scan with no further inter-warp phase. Consumer warps then
+    // fetch their carries locally, avoiding a shared-memory exchange to return
+    // completed prefixes to the original warp owners.
     ScanLoweringHelper totalsHelper(totalsLayout, op.getAxis());
     assert(!totalsHelper.getInterWarpTotalsLayout() &&
            "the full totals sequence must be warp-local");
@@ -301,14 +339,20 @@ private:
                              warpId, rewriter);
   }
 
-  // Store the complete totals table once. Scan each independent sequence,
-  // selecting carries only at positions requested by their consumers.
-  // Complete each consumer's local prefixes as soon as its carry is available.
-  // This path applies when thread-local and warp-local segments coincide and
-  // the inter-warp scan axis lies entirely in registers. interWarpScanLayout
-  // describes the full sequence available to each participating warp. The
-  // lowering loads and accumulates totals in logical order, completing each
-  // consumer as soon as its last candidate prefix has been processed.
+  // Store the complete totals table once, then load and scan each independent
+  // sequence in traversal order. This path applies when thread-local and
+  // warp-local segments coincide and the inter-warp scan axis lies entirely in
+  // registers. interWarpScanLayout maps each participating warp to the full
+  // totals sequence. Complete each consumer as soon as its last candidate
+  // prefix has been processed.
+  //
+  // The general conversion materializes the replicated totals in registers.
+  // For long, wide tuples this can keep many values live at once. Grouped
+  // traversal loads one tuple at a time and maintains a running prefix plus
+  // the carries still being selected. Completing consumers during traversal
+  // shortens these temporary live ranges. The helper enables this path using
+  // the replicated register footprint and the size of the complete shared
+  // table. Each warp still scans the sequence for its own consumers.
   //
   // For an axis-0 scan of 128x32 (f32,i64) tuples, use four 32-lane warps.
   // Lane l owns column l; warp w owns rows 4r+w. Both segment sizes are one.
@@ -344,7 +388,10 @@ private:
     unsigned numRegs = scan.getInDimSize(kReg);
     bool reverse = op.getReverse();
 
-    // Adjacent independent scans occupy adjacent shared-memory elements.
+    // Make the independent-scan coordinates the minor dimensions in shared
+    // memory. Adjacent lane-owned scans then access adjacent elements: in the
+    // example, the offset is 32*s+l, giving contiguous accesses across columns.
+    // This storage order is independent of the source register numbering.
     auto dims = llvm::to_vector(scan.getOutDimNames());
     llvm::erase(dims, axis);
     dims.push_back(axis);
@@ -357,6 +404,9 @@ private:
     unsigned rowStride = independentScans.getTotalOutDimSize();
     auto scratch = helper.getGroupedInterWarpScratchConfig();
     Value smem = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op);
+    // Each tuple operand occupies its own aligned range in the allocation.
+    // Keeping all ranges resident lets one barrier cover the complete tuple
+    // table, including operands with different element widths.
     SmallVector<Value> bases;
     SmallVector<Type> types;
     for (auto [i, type] : llvm::enumerate(op.getElementTypes())) {
@@ -373,6 +423,8 @@ private:
           .front()
           .second;
     };
+    // Zero lane/warp bases describe replicated owners. Select one writer for
+    // each shared element; every consuming lane may subsequently read it.
     auto free = source.getFreeVariableMasks();
     Value storePred =
         b.and_(b.icmp_eq(b.and_(laneId, b.i32_val(free[kLane])), b.i32_val(0)),
@@ -385,13 +437,23 @@ private:
                                 storePred);
       }
     }
+    // All operands are stored before this barrier. The following traversal
+    // only reads the table, so it needs no barriers between operands or scans.
     targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
 
     auto inverse = scan.pseudoinvert().sublayout(
         llvm::to_vector(scan.getOutDimNames()), {kReg, kLane});
     unsigned segmentRegs = values.size() / totals.size();
+    // For one-value segments, the inclusive prefix is already the final
+    // output. Select it directly to avoid a carry combine and its boundary
+    // select. Multi-value segments need an exclusive carry for all local
+    // prefixes, with the scan boundary excluded by carry.pred.
     bool inclusive = segmentRegs == 1;
     SmallVector<Value> consumerRegs;
+    // Index consumers by candidate source register at compile time. Each
+    // accumulated prefix updates only consumers that can request it. The bool
+    // marks the last candidate in traversal order, when that consumer can be
+    // completed and its selected carry has no further uses in this traversal.
     SmallVector<SmallVector<std::pair<unsigned, bool>>> consumers(numRegs);
     SmallVector<ScanCarry> carries;
     for (unsigned r = 0; r < totals.size(); ++r) {
@@ -404,6 +466,9 @@ private:
       Value pred = b.icmp_ne(index, b.i32_val(reverse ? numSegments - 1 : 0));
       consumerRegs.push_back(
           applyLinearLayout(loc, rewriter, inverse, coords).front().second);
+      // Excluding the scan boundary removes its wrapped candidate from the
+      // exclusive lookup. That candidate could otherwise keep a carry live
+      // until the opposite end of the sequence despite being masked out.
       auto candidates =
           getScanRegisters(source, inverse, r, op.getAxis(), numSegments,
                            inclusive ? 0 : (reverse ? 1 : -1),
@@ -437,7 +502,10 @@ private:
           if (carry.values.empty()) {
             carry.values = acc;
           } else {
-            // One-value segments consume the inclusive prefix directly.
+            // Forward traversal retains the last prefix at or before the
+            // consumer (strictly before for exclusive carries). Reverse
+            // traversal uses the symmetric comparison. Reuse this predicate
+            // across tuple operands, whose prefix positions must agree.
             Value selected;
             if (inclusive)
               selected = reverse ? b.icmp_uge(b.i32_val(reg), consumerRegs[r])
@@ -464,8 +532,11 @@ private:
     }
   }
 
-  // Include inter-warp carries in the thread totals before fetching the
-  // preceding thread's total, so each local prefix receives one complete carry.
+  // Add inter-warp carries to the warp-local prefixes in intraWarpScanLayout,
+  // then restore intraWarpTotalsLayout. Each inclusive prefix replaces its
+  // thread segment's terminal value. Fetch the preceding segment's prefix for
+  // the remaining elements, using the retained inter-warp carry at a warp-local
+  // boundary. The scan boundary preserves its original element prefixes.
   void applyScanCarries(triton::ScanOp op, const ScanLoweringHelper &helper,
                         ScanValues &values, ScanValues &intraWarpTotals,
                         ArrayRef<ScanCarry> interWarpCarries, Value laneId,
@@ -482,12 +553,17 @@ private:
     unsigned segmentRegs = helper.getThreadSegmentSize();
     unsigned numSegments = helper.getWarpSegmentSize() / segmentRegs;
     const auto &scanLayout = *helper.getIntraWarpScanLayout();
+    // Include the inter-warp prefix once per thread total. Fetching the
+    // preceding total then supplies one complete carry to each saved local
+    // prefix, so those elements need a single final combine.
     if (!interWarpCarries.empty())
       applySegmentCarries(op, intraWarpTotals, interWarpCarries, rewriter);
     convertScanValues(op, intraWarpTotals, scanLayout, intraWarpTotalsLayout,
                       rewriter);
 
-    // Terminal prefixes are complete; only the other registers need carries.
+    // Reuse the inclusive prefix for each terminal element, saving one combine
+    // and its boundary select per thread segment. One-value segments are now
+    // complete and avoid the subsequent predecessor gather entirely.
     for (unsigned r = 0; r < intraWarpTotals.size(); ++r)
       values[r * segmentRegs + (op.getReverse() ? 0 : segmentRegs - 1)] =
           intraWarpTotals[r];
@@ -515,6 +591,11 @@ private:
 
   // Subtracting 2^k logical positions borrows through axis bits k and above.
   // Consecutive physical lane bits make that subtraction a constant shuffle-up.
+  // Callers supply power-of-two distances. For example, logical axis basis
+  // values [1,2,4] mapped to physical lane masks [2,4,8] turn an axis offset of
+  // -1 into shuffle-up by 2, preserving lane bit 0 for independent scans.
+  // The scan rounds can then omit runtime source-lane calculations. Other
+  // mappings, including reverse traversal, retain the indexed shuffle path.
   static std::optional<unsigned>
   getShuffleUpDistance(const LinearLayout &layout,
                        const LinearLayout &inverseLayout, unsigned axis,
@@ -523,6 +604,9 @@ private:
       return std::nullopt;
     auto *ctx = layout.getInDimNames().begin()->getContext();
     auto kLane = StringAttr::get(ctx, "lane");
+    // A zero logical offset must preserve the current lane. Otherwise the
+    // inverse already permutes lane ownership, and subtracting a fixed physical
+    // distance from the current lane would address a different source.
     if (!layout.compose(inverseLayout).isIdentityOnOutDim(kLane))
       return std::nullopt;
 
@@ -533,13 +617,18 @@ private:
     unsigned stride = bases[first][laneDim];
     if (!llvm::isPowerOf2_32(stride))
       return std::nullopt;
+    // Every higher bit through which subtraction can borrow must map to the
+    // next physical lane bit. Bits outside this segment are preserved.
     for (unsigned bit = first + 1; bit < llvm::Log2_32(segmentsPerScan); ++bit)
       if (bases[bit][laneDim] != (stride << (bit - first)))
         return std::nullopt;
     return stride;
   }
 
-  // Enumerate registers requested at an axis offset within each scan.
+  // Enumerate candidate source registers at a logical axis offset from one
+  // consumer register, across all of its lane and warp owners. This enumeration
+  // runs at compile time. Deduplicating the register indices limits shuffles
+  // and selects to values that at least one consumer can request.
   static SmallVector<unsigned>
   getScanRegisters(const LinearLayout &segmentLayout,
                    const LinearLayout &inverseTotalsLayout, unsigned reg,
@@ -568,7 +657,11 @@ private:
   }
 
   // Select after shuffling: each destination lane may request a different
-  // register from its source lane.
+  // register from its source lane. The predicate belongs to the receiving lane;
+  // applying it in the sending lane would choose a different register in
+  // general. The first candidate initializes the result. Each additional
+  // candidate needs one select per operand; all operands share the same source
+  // coordinates and selection predicate.
   SmallVector<Value> shuffleCarry(Location loc, const ScanValues &totals,
                                   ArrayRef<unsigned> candidates, Value srcReg,
                                   Value srcLane,
@@ -588,7 +681,9 @@ private:
     return carry;
   }
 
-  // Map each consumer segment to its preceding prefix in the totals layout.
+  // Map each consumer segment to the preceding prefix in scan traversal order.
+  // Return a predicate excluding the first segment, without assuming an
+  // identity.
   SmallVector<ScanCarry>
   getSegmentCarries(triton::ScanOp op, const ScanValues &totals,
                     const LinearLayout &segmentLayout,
@@ -604,8 +699,10 @@ private:
     auto kBlock = StringAttr::get(ctx, "block");
     auto axis = StringAttr::get(ctx, "dim" + std::to_string(op.getAxis()));
     bool reverse = op.getReverse();
-    // The totals sequence is available in every consuming warp. CTA ownership
-    // is preserved, so lookup uses only register and lane coordinates.
+    // Each requested nonboundary prefix is available within the consuming warp:
+    // interWarpScanLayout replicates the full sequence; intraWarpTotalsLayout
+    // holds the warp-local sequence. CTA ownership is preserved, so the source
+    // lookup uses only register and lane coordinates.
     auto inverse = totalsLayout.pseudoinvert().sublayout(
         llvm::to_vector(totalsLayout.getOutDimNames()), {kReg, kLane});
     unsigned numSegments = segmentLayout.getOutDimSize(axis);
@@ -656,7 +753,10 @@ private:
       }
   }
 
-  // Guard the combine (including side effects) and preserve boundary values.
+  // Preserve boundary values without requiring a combiner identity. The common
+  // helper inlines speculatable arithmetic and guards non-speculatable regions
+  // with control flow. The final select preserves the original prefix when
+  // pred is false, including when the combine was executed speculatively.
   SmallVector<Value> combineWithPrefix(triton::ScanOp op, ValueRange prefix,
                                        ValueRange values,
                                        ConversionPatternRewriter &rewriter,
