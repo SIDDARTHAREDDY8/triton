@@ -246,10 +246,6 @@ private:
     return totals;
   }
 
-  // Convert warp-local segment totals into the full sequence in each
-  // participating warp, then scan it. Return exclusive carries in
-  // interWarpTotalsLayout. Grouped traversal completes values directly and
-  // returns no carries.
   SmallVector<ScanCarry>
   scanAcrossWarps(triton::ScanOp op, const ScanLoweringHelper &helper,
                   ScanValues &values, Value laneId, Value warpId,
@@ -717,10 +713,6 @@ private:
       }
   }
 
-  // Preserve boundary values without requiring a combiner identity. The common
-  // helper inlines speculatable arithmetic and guards non-speculatable regions
-  // with control flow. The final select preserves the original prefix when
-  // pred is false, including when the combine was executed speculatively.
   SmallVector<Value> combineWithPrefix(triton::ScanOp op, ValueRange prefix,
                                        ValueRange values,
                                        ConversionPatternRewriter &rewriter,
