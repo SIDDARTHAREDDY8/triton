@@ -570,9 +570,7 @@ private:
       return std::nullopt;
     auto *ctx = layout.getInDimNames().begin()->getContext();
     auto kLane = StringAttr::get(ctx, "lane");
-    // A zero logical offset must preserve the current lane. Otherwise the
-    // inverse already permutes lane ownership, and subtracting a fixed physical
-    // distance from the current lane would address a different source.
+    // layout and inverseLayout.inverse() may be different
     if (!layout.compose(inverseLayout).isIdentityOnOutDim(kLane))
       return std::nullopt;
 
@@ -583,8 +581,8 @@ private:
     unsigned stride = bases[first][laneDim];
     if (!llvm::isPowerOf2_32(stride))
       return std::nullopt;
-    // Every higher bit through which subtraction can borrow must map to the
-    // next physical lane bit. Bits outside this segment are preserved.
+    // After the first stride, each subsequent stride must be a power-of-2
+    // multiple of the first.
     for (unsigned bit = first + 1; bit < llvm::Log2_32(segmentsPerScan); ++bit)
       if (bases[bit][laneDim] != (stride << (bit - first)))
         return std::nullopt;
