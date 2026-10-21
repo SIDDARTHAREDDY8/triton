@@ -298,35 +298,10 @@ private:
                              warpId, rewriter);
   }
 
-  // Store the complete totals table once, then load and scan each independent
-  // sequence in traversal order. This path applies when thread-local and
-  // warp-local segments coincide and the inter-warp scan axis lies entirely in
-  // registers. interWarpScanLayout maps each participating warp to the full
-  // totals sequence. Complete each consumer as soon as its last candidate
-  // prefix has been processed.
-  //
   // The general conversion materializes the replicated totals in registers.
-  // For long, wide tuples this can keep many values live at once. Grouped
-  // traversal loads one tuple at a time and maintains a running prefix plus
-  // the carries still being selected. Completing consumers during traversal
-  // shortens these temporary live ranges. The helper enables this path using
-  // the replicated register footprint and the size of the complete shared
-  // table. Each warp still scans the sequence for its own consumers.
-  //
-  // For an axis-0 scan of 128x32 (f32,i64) tuples, use four 32-lane warps.
-  // Lane l owns column l; warp w owns rows 4r+w. Both segment sizes are one.
-  // Let T(s,l) be the segment total for row s and column l. Scan-axis bases
-  // are R=[4,8,16,32,64], L=[0,0,0,0,0], W=[1,2]; lane bases index columns.
-  // interWarpTotalsLayout preserves this ownership. interWarpScanLayout has
-  // R=[1,2,4,8,16,32,64], the same column lane bases, and W=[0,0].
-  // Store T(s,l) at element offset 32*s+l in each operand's shared table and
-  // synchronize once after all operands are stored. Each warp's lane l reads
-  // T(0,l),...,T(127,l), maintaining one running tuple prefix. Layout
-  // division separates the scan axis from independent scans and gives their
-  // table bases. Warp w consumes the inclusive prefixes for s=4r+w directly.
-  // For segments with several elements, apply the exclusive prefix to their
-  // saved local prefixes, guarding the first segment. This completes the
-  // element values during the shared-memory traversal.
+  // For long, wide tuples this can keep many registers live at once. Grouped
+  // traversal loads one group at a time and maintains a running prefix and
+  // the carries.
   void scanInterWarpGroups(triton::ScanOp op, const ScanLoweringHelper &helper,
                            const ScanValues &totals, ScanValues &values,
                            Value laneId, Value warpId,
@@ -340,6 +315,7 @@ private:
     auto kBlock = StringAttr::get(ctx, "block");
     auto axis = StringAttr::get(ctx, "dim" + std::to_string(op.getAxis()));
     const auto &source = *helper.getInterWarpTotalsLayout();
+    // Note that totalsHelper is constructed from interWarpScanLayout now
     ScanLoweringHelper totalsHelper(*helper.getInterWarpScanLayout(),
                                     op.getAxis());
     const auto &scan = totalsHelper.getPermutedLayout();
@@ -347,25 +323,18 @@ private:
     unsigned numRegs = scan.getInDimSize(kReg);
     bool reverse = op.getReverse();
 
-    // Make the independent-scan coordinates the minor dimensions in shared
-    // memory. Adjacent lane-owned scans then access adjacent elements: in the
-    // example, the offset is 32*s+l, giving contiguous accesses across columns.
-    // This storage order is independent of the source register numbering.
+    // Factor the contiguous scan axis out of the register layout. The
+    // quotient maps each independent scan to its shared-memory base.
     auto dims = llvm::to_vector(scan.getOutDimNames());
     llvm::erase(dims, axis);
     dims.push_back(axis);
     auto storeLayout = source.transposeOuts(dims).flattenOuts();
-    // Factor the contiguous scan axis out of the register layout. The
-    // quotient maps each independent scan to its shared-memory base.
     auto scanAxis = LinearLayout::identity1D(numSegments, kReg, axis);
     auto independentScans = divideLeft(scan, scanAxis).value();
     auto loadLayout = independentScans.transposeOuts(dims).flattenOuts();
     unsigned rowStride = independentScans.getTotalOutDimSize();
     auto scratch = helper.getGroupedInterWarpScratchConfig();
     Value smem = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op);
-    // Each tuple operand occupies its own aligned range in the allocation.
-    // Keeping all ranges resident lets one barrier cover the complete tuple
-    // table, including operands with different element widths.
     SmallVector<Value> bases;
     SmallVector<Type> types;
     for (auto [i, type] : llvm::enumerate(op.getElementTypes())) {
@@ -382,8 +351,6 @@ private:
           .front()
           .second;
     };
-    // Zero lane/warp bases describe replicated owners. Select one writer for
-    // each shared element; every consuming lane may subsequently read it.
     auto free = source.getFreeVariableMasks();
     Value storePred =
         b.and_(b.icmp_eq(b.and_(laneId, b.i32_val(free[kLane])), b.i32_val(0)),
@@ -396,8 +363,6 @@ private:
                                 storePred);
       }
     }
-    // All operands are stored before this barrier. The following traversal
-    // only reads the table, so it needs no barriers between operands or scans.
     targetInfo.barrier(loc, rewriter, triton::gpu::AddrSpace::Local);
 
     auto inverse = scan.pseudoinvert().sublayout(
@@ -405,14 +370,9 @@ private:
     unsigned segmentRegs = values.size() / totals.size();
     // For one-value segments, the inclusive prefix is already the final
     // output. Select it directly to avoid a carry combine and its boundary
-    // select. Multi-value segments need an exclusive carry for all local
-    // prefixes, with the scan boundary excluded by carry.pred.
+    // select. 
     bool inclusive = segmentRegs == 1;
     SmallVector<Value> consumerRegs;
-    // Index consumers by candidate source register at compile time. Each
-    // accumulated prefix updates only consumers that can request it. The bool
-    // marks the last candidate in traversal order, when that consumer can be
-    // completed and its selected carry has no further uses in this traversal.
     SmallVector<SmallVector<std::pair<unsigned, bool>>> consumers(numRegs);
     SmallVector<ScanCarry> carries;
     for (unsigned r = 0; r < totals.size(); ++r) {
@@ -425,9 +385,6 @@ private:
       Value pred = b.icmp_ne(index, b.i32_val(reverse ? numSegments - 1 : 0));
       consumerRegs.push_back(
           applyLinearLayout(loc, rewriter, inverse, coords).front().second);
-      // Excluding the scan boundary removes its wrapped candidate from the
-      // exclusive lookup. That candidate could otherwise keep a carry live
-      // until the opposite end of the sequence despite being masked out.
       auto candidates =
           getScanRegisters(source, inverse, r, op.getAxis(), numSegments,
                            inclusive ? 0 : (reverse ? 1 : -1),
@@ -461,10 +418,6 @@ private:
           if (carry.values.empty()) {
             carry.values = acc;
           } else {
-            // Forward traversal retains the last prefix at or before the
-            // consumer (strictly before for exclusive carries). Reverse
-            // traversal uses the symmetric comparison. Reuse this predicate
-            // across tuple operands, whose prefix positions must agree.
             Value selected;
             if (inclusive)
               selected = reverse ? b.icmp_uge(b.i32_val(reg), consumerRegs[r])
