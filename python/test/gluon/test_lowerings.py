@@ -335,6 +335,8 @@ def _scan_combine_adjacent_intervals(lo1, hi1, lo2, hi2):
         id="interwarp_groups_interleaved_independent_registers"),
     pytest.param(ttgl.BlockedLayout([2, 1], [1, THREADS_PER_WARP], [4, 1], [0, 1]), 256, 32,
                  id="interwarp_groups_thread_prefixes"),
+    pytest.param(ttgl.BlockedLayout([4, 1], [1, THREADS_PER_WARP], [2, 2], [0, 1]), 128, 128,
+                 id="interwarp_groups_thread_prefixes_independent_scans"),
     pytest.param(ttgl.BlockedLayout([4, 1], [THREADS_PER_WARP // 2, 2], [2, 2], [0, 1]), 8 * THREADS_PER_WARP, 8,
                  id="register_axis_boundary_carry_owners"),
     pytest.param(ttgl.BlockedLayout([1, 1], [THREADS_PER_WARP, 1], [1, 4], [0, 1]), THREADS_PER_WARP,

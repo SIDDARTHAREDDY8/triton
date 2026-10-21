@@ -315,22 +315,19 @@ private:
     auto kBlock = StringAttr::get(ctx, "block");
     auto axis = StringAttr::get(ctx, "dim" + std::to_string(op.getAxis()));
     const auto &source = *helper.getInterWarpTotalsLayout();
-    // Note that totalsHelper is constructed from interWarpScanLayout now
-    ScanLoweringHelper totalsHelper(*helper.getInterWarpScanLayout(),
-                                    op.getAxis());
-    const auto &scan = totalsHelper.getPermutedLayout();
-    unsigned numSegments = scan.getOutDimSize(axis);
-    unsigned numRegs = scan.getInDimSize(kReg);
+    auto scan = *helper.getInterWarpScanLayout();
+    unsigned numTotals = scan.getOutDimSize(axis);
     bool reverse = op.getReverse();
 
     // Factor the contiguous scan axis out of the register layout. The
     // quotient maps each independent scan to its shared-memory base.
+    auto scanAxis = LinearLayout::identity1D(numTotals, kReg, axis);
+    scan = regPermForDivide(scan, scanAxis, /*left=*/true)->apply(scan);
+    auto independentScans = divideLeft(scan, scanAxis).value();
     auto dims = llvm::to_vector(scan.getOutDimNames());
     llvm::erase(dims, axis);
     dims.push_back(axis);
     auto storeLayout = source.transposeOuts(dims).flattenOuts();
-    auto scanAxis = LinearLayout::identity1D(numSegments, kReg, axis);
-    auto independentScans = divideLeft(scan, scanAxis).value();
     auto loadLayout = independentScans.transposeOuts(dims).flattenOuts();
     unsigned rowStride = independentScans.getTotalOutDimSize();
     auto scratch = helper.getGroupedInterWarpScratchConfig();
@@ -370,10 +367,11 @@ private:
     unsigned segmentRegs = values.size() / totals.size();
     // For one-value segments, the inclusive prefix is already the final
     // output. Select it directly to avoid a carry combine and its boundary
-    // select. 
+    // select.
     bool inclusive = segmentRegs == 1;
     SmallVector<Value> consumerRegs;
-    SmallVector<SmallVector<std::pair<unsigned, bool>>> consumers(numRegs);
+    SmallVector<SmallVector<std::pair<unsigned, bool>>> consumers(
+        scan.getInDimSize(kReg));
     SmallVector<ScanCarry> carries;
     for (unsigned r = 0; r < totals.size(); ++r) {
       auto coords = applyLinearLayout(loc, rewriter, source,
@@ -382,11 +380,11 @@ private:
                                        {kWarp, warpId},
                                        {kBlock, b.i32_val(0)}});
       Value index = coords[op.getAxis()].second;
-      Value pred = b.icmp_ne(index, b.i32_val(reverse ? numSegments - 1 : 0));
+      Value pred = b.icmp_ne(index, b.i32_val(reverse ? numTotals - 1 : 0));
       consumerRegs.push_back(
           applyLinearLayout(loc, rewriter, inverse, coords).front().second);
       auto candidates =
-          getScanRegisters(source, inverse, r, op.getAxis(), numSegments,
+          getScanRegisters(source, inverse, r, op.getAxis(), numTotals,
                            inclusive ? 0 : (reverse ? 1 : -1),
                            /*excludeBoundary=*/!inclusive);
       llvm::sort(candidates, [reverse](unsigned a, unsigned b) {
@@ -402,9 +400,9 @@ private:
       unsigned scanIndex = reverse ? numScans - 1 - n : n;
       Value base = offset(loadLayout, scanIndex);
       SmallVector<Value> acc;
-      for (unsigned i = 0; i < numSegments; ++i) {
-        unsigned segment = reverse ? numSegments - 1 - i : i;
-        unsigned reg = scanIndex * numSegments + segment;
+      for (unsigned i = 0; i < numTotals; ++i) {
+        unsigned segment = reverse ? numTotals - 1 - i : i;
+        unsigned reg = scanIndex * numTotals + segment;
         Value index = b.add(base, b.i32_val(segment * rowStride));
         SmallVector<Value> current;
         for (unsigned i = 0; i < types.size(); ++i) {
@@ -418,13 +416,10 @@ private:
           if (carry.values.empty()) {
             carry.values = acc;
           } else {
-            Value selected;
-            if (inclusive)
-              selected = reverse ? b.icmp_uge(b.i32_val(reg), consumerRegs[r])
-                                 : b.icmp_ule(b.i32_val(reg), consumerRegs[r]);
-            else
-              selected = reverse ? b.icmp_ugt(b.i32_val(reg), consumerRegs[r])
-                                 : b.icmp_ult(b.i32_val(reg), consumerRegs[r]);
+            // Axis registers are consecutive. An exclusive prefix serves
+            // the adjacent consumer register in traversal order.
+            unsigned consumer = inclusive ? reg : (reverse ? reg - 1 : reg + 1);
+            Value selected = b.icmp_eq(consumerRegs[r], b.i32_val(consumer));
             for (unsigned i = 0; i < types.size(); ++i)
               carry.values[i] = b.select(selected, acc[i], carry.values[i]);
           }
