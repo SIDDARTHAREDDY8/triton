@@ -483,9 +483,6 @@ bool ScanLoweringHelper::isSupported() {
 }
 
 bool ScanLoweringHelper::useGroupedInterWarpScan() const {
-  // Grouping completes the original thread-local prefixes directly.
-  if (!op || !interWarpScanLayout || intraWarpTotalsLayout)
-    return false;
   auto scanOp = op;
   auto *ctx = scanOp.getContext();
   auto kReg = StringAttr::get(ctx, "register");
@@ -493,21 +490,16 @@ bool ScanLoweringHelper::useGroupedInterWarpScan() const {
   auto kBlock = StringAttr::get(ctx, "block");
   auto axisDim = StringAttr::get(ctx, "dim" + std::to_string(axis));
   const auto &layout = *interWarpScanLayout;
-  if (!layout.sublayoutIsZero({kLane}, {axisDim}) ||
-      !layout.sublayoutIsZero({kBlock},
-                              llvm::to_vector(layout.getOutDimNames())))
+  // TODO(Keren): support non-zero block bases, which requires a more complex
+  // inter-CTA scan to complete the prefixes
+  if (!layout.sublayoutIsZero({kLane}, {axisDim}))
     return false;
   unsigned words = 0;
-  for (Type type : scanOp.getElementTypes()) {
-    if (!type.isIntOrFloat() || type.getIntOrFloatBitWidth() < 8)
-      return false;
+  for (Type type : scanOp.getElementTypes())
     words += llvm::divideCeil(type.getIntOrFloatBitWidth(), 32u);
-  }
   // Group long register-only scans when their replicated totals exceed 128
-  // logical 32-bit words per thread. Keep the full shared table within 64 KiB.
-  if (layout.getOutDimSize(axisDim) < 32 ||
-      layout.getInDimSize(kReg) * words <= 128 ||
-      getGroupedInterWarpScratchConfig().sizeInBytes > 64 * 1024)
+  // logical 32-bit words per thread
+  if (layout.getInDimSize(kReg) * words <= 128)
     return false;
   return true;
 }

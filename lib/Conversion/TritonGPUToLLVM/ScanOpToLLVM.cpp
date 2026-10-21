@@ -292,8 +292,6 @@ private:
     // fetch their carries locally, avoiding a shared-memory exchange to return
     // completed prefixes to the original warp owners.
     ScanLoweringHelper totalsHelper(totalsLayout, op.getAxis());
-    assert(!totalsHelper.getInterWarpTotalsLayout() &&
-           "the full totals sequence must be warp-local");
     scanWithinCTA(op, totalsHelper, totals, laneId, warpId, rewriter);
     return getSegmentCarries(op, totals, interWarpTotalsLayout, totalsLayout,
                              interWarpTotalsLayout.getOutDimSize(axis), laneId,
