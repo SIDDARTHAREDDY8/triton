@@ -114,7 +114,7 @@ SmallVector<SmallVector<Value>> convertLayoutValues(
     const LinearLayout &srcLayout, const LinearLayout &dstLayout,
     const SmallVector<SmallVector<Value>> &inVals,
     const LLVMTypeConverter *typeConverter, const TargetInfoBase &targetInfo,
-    bool forceWarpShuffle = false) {
+    bool forceWarpShuffle = false, Value storePred = {}) {
   SmallVector<SmallVector<Value>> outVals(op.getNumOperands());
   auto *ctx = rewriter.getContext();
   SmallVector<int64_t> shape;
@@ -150,6 +150,18 @@ SmallVector<SmallVector<Value>> convertLayoutValues(
   auto offsetTy = IntegerType::get(ctx, 32);
   for (unsigned i = 0; i < op.getNumOperands(); ++i) {
     auto elemTy = op.getElementTypes()[i];
+    if (storePred) {
+      assert(!forceWarpShuffle && scratch.sizeInBytes &&
+             "selected producers require a shared-memory conversion");
+      auto b = TritonLLVMOpBuilder(loc, rewriter);
+      Value smem = LLVM::getSharedMemoryBase(loc, rewriter, targetInfo, op);
+      Value base =
+          b.gep(smem.getType(), i8_ty, smem, b.i32_val(scratch.offsets[i]));
+      outVals[i] = convertLayoutViaSharedMemory(
+          loc, rewriter, srcLayout, dstLayout, inVals[i],
+          typeConverter->convertType(elemTy), base, op, targetInfo, storePred);
+      continue;
+    }
     auto srcTy = RankedTensorType::get(shape, elemTy, srcEnc);
     auto dstTy = RankedTensorType::get(shape, elemTy, dstEnc);
     Value packed = packUniqueTensorElements(loc, typeConverter, inVals[i],

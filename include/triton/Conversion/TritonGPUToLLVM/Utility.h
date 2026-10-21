@@ -780,6 +780,16 @@ void makeAllWarpGroupsIsolatedFromAbove(Operation *op);
 // Set the correct loop annotation on LLVM branch ops.
 void fixUpLoopAnnotation(ModuleOp mod);
 
+// Convert LLVM values through shared memory. When storePred is supplied,
+// source values must be valid in the selected producer lanes, which must
+// cover every logical element. Loads retain the destination layout's owners.
+SmallVector<Value> convertLayoutViaSharedMemory(
+    Location loc, ConversionPatternRewriter &rewriter,
+    const LinearLayout &srcLayout, const LinearLayout &dstLayout,
+    ArrayRef<Value> inVals, Type llvmElemTy, Value smemBase,
+    Operation *sourceOp, const TargetInfoBase &targetInfo,
+    Value storePred = {});
+
 void transferSwizzlingLocalMem(triton::gpu::ConvertLayoutOp op, Value src,
                                const TargetInfoBase &targetInfo,
                                const LLVMTypeConverter *typeConverter,
