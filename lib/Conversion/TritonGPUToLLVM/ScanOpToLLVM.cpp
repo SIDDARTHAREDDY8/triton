@@ -32,9 +32,6 @@ struct ScanOpConversion : public ConvertOpToLLVMPattern<triton::ScanOp> {
       return op.emitError("scan axis distributed across CTAs is not supported");
 
     auto loc = op.getLoc();
-    // The LLVM representation stores only unique register values. Match the
-    // helper's layout with zero register bases removed, so broadcast copies
-    // share the same scan computation and remain implicit in the result.
     ScanValues values;
     for (Value operand : adaptor.getOperands()) {
       auto unpacked = unpackUniqueTensorElements(loc, operand, rewriter);
@@ -66,11 +63,6 @@ struct ScanOpConversion : public ConvertOpToLLVMPattern<triton::ScanOp> {
   }
 
 private:
-  // Keep element prefixes in their thread owners while subsequent phases
-  // exchange only segment totals. Optional layouts omit phases whose segment
-  // is already owned by one thread or warp. The intra-warp scan layout remains
-  // active through inter-warp total extraction, avoiding an intermediate
-  // conversion back to the element owners.
   void scanWithinCTA(triton::ScanOp op, const ScanLoweringHelper &helper,
                      ScanValues &values, Value laneId, Value warpId,
                      ConversionPatternRewriter &rewriter) const {
@@ -139,10 +131,6 @@ private:
     values = transposeValues(operands);
   }
 
-  // Intra-warp redistributions force register/shuffle lowering, avoiding shared
-  // scratch and synchronization even if the generic conversion heuristic would
-  // choose shared memory. Inter-warp conversion clears this flag to enable the
-  // target's shared-memory lowering. Identical layouts require no conversion.
   void convertScanValues(triton::ScanOp op, ScanValues &values,
                          const LinearLayout &src, const LinearLayout &dst,
                          ConversionPatternRewriter &rewriter,
@@ -174,13 +162,6 @@ private:
       }
   }
 
-  // Each round shuffles the preceding lanes' terminal total and combines it
-  // with every register prefix in the group. One tuple of shuffled values is
-  // reused across numRegs prefixes. For four totals per lane and eight lanes,
-  // there are three shuffle rounds, each followed by four tuple combines.
-  // Updating all prefixes during these rounds completes the group without a
-  // separate exclusive-carry shuffle. The cost is a combine per register per
-  // round. A register-only sequence exits before creating lane indices.
   void scanLaneTotals(triton::ScanOp op, ScanValues &values,
                       const LinearLayout &layout, unsigned numRegs,
                       unsigned numSegments, Value laneId,
@@ -205,11 +186,10 @@ private:
     if (numSegments != axisSize)
       segmentIndex = b.and_(index, b.i32_val(numSegments - 1));
 
-    // Shift logical coordinates and invert the layout to find the source lane.
-    // Preserve coordinates belonging to independent scans. Compute source lanes
-    // and boundary predicates once and reuse them across register groups and
-    // tuple operands. A recognized shuffle-up distance also eliminates the
-    // runtime source-lane calculation for that round.
+    // Depending on the interval, we maybe able to use shuffleUp or shuffleIdx.
+    // The former is more efficient, but it only works when the distance is a
+    // power of 2. The latter is more general, but it requires a lane index to
+    // be computed and passed in.
     SmallVector<std::tuple<Value, Value, std::optional<unsigned>>> rounds;
     for (unsigned offset = 1; offset < numLanes; offset *= 2) {
       int distance = offset * numRegs;
@@ -242,13 +222,6 @@ private:
     }
   }
 
-  // Extract thread-local totals in intraWarpTotalsLayout and convert them to
-  // intraWarpScanLayout. Scan its contiguous register groups, then combine
-  // prefixes across lanes. Return warp-local prefixes in intraWarpScanLayout;
-  // the caller retains the original element prefixes for carry propagation.
-  // Making low axis bits register-owned lets one lane-total shuffle serve
-  // several totals. Only the extracted totals pay the conversion cost; the
-  // elements within their original thread-local segments stay in place.
   ScanValues scanWithinWarps(triton::ScanOp op,
                              const ScanLoweringHelper &helper,
                              const ScanValues &values, Value laneId,
@@ -589,13 +562,6 @@ private:
                         /*skipTerminal=*/true);
   }
 
-  // Subtracting 2^k logical positions borrows through axis bits k and above.
-  // Consecutive physical lane bits make that subtraction a constant shuffle-up.
-  // Callers supply power-of-two distances. For example, logical axis basis
-  // values [1,2,4] mapped to physical lane masks [2,4,8] turn an axis offset of
-  // -1 into shuffle-up by 2, preserving lane bit 0 for independent scans.
-  // The scan rounds can then omit runtime source-lane calculations. Other
-  // mappings, including reverse traversal, retain the indexed shuffle path.
   static std::optional<unsigned>
   getShuffleUpDistance(const LinearLayout &layout,
                        const LinearLayout &inverseLayout, unsigned axis,
