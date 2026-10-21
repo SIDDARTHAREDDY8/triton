@@ -87,7 +87,7 @@ tt.func public @anchor_warp_register_groups(%ptr: !llvm.ptr, %arg: !llvm.struct<
 // CHECK-LABEL: @test_2d_grouped
 tt.func private @test_2d_grouped(%arg0: tensor<16x1xi32, #layout_2d>) -> tensor<16x1xi32, #layout_2d> {
   // CHECK: tail call i32 @llvm.nvvm.shfl.sync.idx.i32
-  // CHECK: store {{.*}}, ptr addrspace(3)
+  // CHECK: asm sideeffect "@{{.*}} st.shared::cta.
   // CHECK: @llvm.nvvm.barrier
   // CHECK: load i32, ptr addrspace(3)
   // CHECK: ret
@@ -194,7 +194,7 @@ tt.func public @anchor_permuted_lanes(%ptr: !llvm.ptr, %arg: !llvm.struct<(i32, 
 // Exchange the full sequence once, scan it within each warp, then map the
 // exclusive carries back to their original owners.
 // CHECK-NOT: @llvm.nvvm.barrier
-// CHECK: store {{.*}}, ptr addrspace(3)
+// CHECK: asm sideeffect "@{{.*}} st.shared::cta.
 // CHECK: @llvm.nvvm.barrier
 // CHECK: load i32, ptr addrspace(3)
 // CHECK-NOT: @llvm.nvvm.barrier
@@ -277,10 +277,10 @@ tt.func private @test_scan_tuple_reverse(%a: tensor<128x8xi32, #tuple>, %b: tens
 }
 // Each operand conversion uses one store-to-load barrier.
 // TUPLE-LABEL: llvm.func {{.*}}@test_scan_tuple_single_tile
-// TUPLE: llvm.store {{.*}} : vector<1xi32>, !llvm.ptr<3>
+// TUPLE: llvm.inline_asm {{.*}} "@$2 st.shared::cta.b32
 // TUPLE: nvvm.barrier
 // TUPLE: llvm.load {{.*}} : !llvm.ptr<3> -> i32
-// TUPLE: llvm.store {{.*}} : vector<1xi64>, !llvm.ptr<3>
+// TUPLE: llvm.inline_asm {{.*}} "@$2 st.shared::cta.b64
 // TUPLE: nvvm.barrier
 // TUPLE: llvm.load {{.*}} : !llvm.ptr<3> -> i64
 // TUPLE-NOT: nvvm.barrier
@@ -423,12 +423,14 @@ tt.func private @test_scan_reuse_lane_lookups(%arg: tensor<4x2xi32, #parallel>) 
 // after the exchange, when applying carries to the saved prefixes.
 #converted = #ttg.linear<{register = [[4], [8]], lane = [[1], [2], [0], [0], [0]], warp = [[16], [0]], block = []}>
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, ttg.target = "cuda:100"} {
-// Broadcast terminal totals before converting their layout.
+// Store only from each segment's terminal lane; omit the broadcast shuffle.
 // Apply the inter-warp carry to every scanned register prefix after the exchange.
 // TERMINAL-LABEL: llvm.func {{.*}}@test_scan_converted_totals(
-// TERMINAL-COUNT-3: nvvm.shfl.sync idx
+// TERMINAL-COUNT-2: nvvm.shfl.sync idx
 // TERMINAL-NOT: nvvm.shfl.sync
-// TERMINAL: llvm.store {{.*}} : vector<1xi32>, !llvm.ptr<3>
+// TERMINAL: %[[PRED:.*]] = llvm.icmp "eq"
+// TERMINAL-NOT: nvvm.shfl.sync
+// TERMINAL: llvm.inline_asm {{.*}} "@$2 st.shared::cta.b32 {{.*}} %[[PRED]] :
 // TERMINAL-NEXT: nvvm.barrier
 // TERMINAL: llvm.load
 // TERMINAL: nvvm.shfl.sync idx
@@ -448,9 +450,11 @@ tt.func private @test_scan_converted_totals(%arg: tensor<32xi32, #converted>) ->
 }
 
 // TERMINAL-LABEL: llvm.func {{.*}}@test_scan_converted_totals_reverse(
-// TERMINAL-COUNT-3: nvvm.shfl.sync idx
+// TERMINAL-COUNT-2: nvvm.shfl.sync idx
 // TERMINAL-NOT: nvvm.shfl.sync
-// TERMINAL: llvm.store {{.*}} : vector<1xi32>, !llvm.ptr<3>
+// TERMINAL: %[[PRED:.*]] = llvm.icmp "eq"
+// TERMINAL-NOT: nvvm.shfl.sync
+// TERMINAL: llvm.inline_asm {{.*}} "@$2 st.shared::cta.b32 {{.*}} %[[PRED]] :
 // TERMINAL-NEXT: nvvm.barrier
 // TERMINAL: llvm.load
 // TERMINAL: nvvm.shfl.sync idx

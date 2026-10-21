@@ -134,12 +134,13 @@ private:
   void convertScanValues(triton::ScanOp op, ScanValues &values,
                          const LinearLayout &src, const LinearLayout &dst,
                          ConversionPatternRewriter &rewriter,
-                         bool forceWarpShuffle = true) const {
+                         bool forceWarpShuffle = true,
+                         Value storePred = {}) const {
     if (src == dst)
       return;
     auto operands = convertLayoutValues(
         op.getLoc(), rewriter, op, src, dst, transposeValues(values),
-        getTypeConverter(), targetInfo, forceWarpShuffle);
+        getTypeConverter(), targetInfo, forceWarpShuffle, storePred);
     values = transposeValues(operands);
   }
 
@@ -272,28 +273,19 @@ private:
     unsigned segmentLaneMask = getInputBasisMask(
         sourceLayout.resizeOutDim(axis, valuesPerSegment), kLane, {axis});
 
-    // Replicate each complete total according to interWarpTotalsLayout before
-    // the conversion selects a source owner for its shared-memory store.
-    // Collapsing the segment turns its lane bases into zero bases: every such
-    // lane must then hold the same total, allowing the converter to choose any
-    // equivalent owner. Without lane-owned segment bits, extraction alone
-    // provides the total and this shuffle is omitted.
+    // Select the lanes holding complete totals for the shared-memory stores.
+    // Zero lane bases still describe the common address of each segment.
     auto totals = extractSegmentTotals(values, segmentRegs, reverse);
-    if (segmentLaneMask) {
-      Value terminalLane;
-      if (reverse)
-        terminalLane = b.and_(laneId, b.i32_val(~segmentLaneMask));
-      else
-        terminalLane = b.or_(laneId, b.i32_val(segmentLaneMask));
-      for (auto &total : totals)
-        total = shuffleValues(loc, total, terminalLane, rewriter);
-    }
+    Value storePred;
+    if (segmentLaneMask)
+      storePred = b.icmp_eq(b.and_(laneId, b.i32_val(segmentLaneMask)),
+                            b.i32_val(reverse ? 0 : segmentLaneMask));
     if (helper.useGroupedInterWarpScan()) {
       scanInterWarpGroups(op, helper, totals, values, laneId, warpId, rewriter);
       return {};
     }
     convertScanValues(op, totals, interWarpTotalsLayout, totalsLayout, rewriter,
-                      /*forceWarpShuffle=*/false);
+                      /*forceWarpShuffle=*/false, storePred);
 
     // Replication makes the full totals sequence available within each warp.
     // Reuse the CTA scan with no further inter-warp phase. Consumer warps then
